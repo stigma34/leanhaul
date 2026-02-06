@@ -10,11 +10,8 @@ import typer
 import yaml
 from rich.console import Console
 from rich.table import Table
-from typer.main import get_command
 
-# ----------------------------
-# App setup (MULTI-COMMAND)
-# ----------------------------
+console = Console()
 
 app = typer.Typer(
     name="leanhaul",
@@ -22,9 +19,25 @@ app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
 )
-console = Console()
 
 IMAGE_KEY_CANDIDATES = {"image", "images"}
+
+
+# ----------------------------
+# Root callback (FORCES GROUP MODE)
+# ----------------------------
+
+@app.callback(invoke_without_command=True)
+def _root(ctx: typer.Context) -> None:
+    """
+    Leanhaul CLI.
+
+    This callback exists intentionally to force Typer/Click to treat this as a GROUP
+    with subcommands (so `leanhaul butcher ...` works and `butcher` is visible).
+    """
+    if ctx.invoked_subcommand is None:
+        # If user runs just `leanhaul`, show help.
+        console.print(ctx.get_help())
 
 
 # ----------------------------
@@ -34,13 +47,13 @@ IMAGE_KEY_CANDIDATES = {"image", "images"}
 @dataclass(frozen=True)
 class ImageRef:
     original: str
-    base: str
+    base: str         # repo path without tag/digest
     tag: Optional[str]
     digest: Optional[str]
 
 
 _IMAGE_WITH_DIGEST = re.compile(r"^(?P<base>.+?)@(?P<digest>sha256:[0-9a-fA-F]{64})$")
-_IMAGE_WITH_TAG = re.compile(r"^(?P<base>.+?):(?P<tag>[^/]+)$")  # tag cannot contain '/'
+_IMAGE_WITH_TAG = re.compile(r"^(?P<base>.+?):(?P<tag>[^/]+)$")  # tag can't contain '/'
 
 
 def parse_image_ref(s: str) -> Optional[ImageRef]:
@@ -73,7 +86,7 @@ def normalize_tag(tag: str) -> str:
 
 def version_key(tag: str) -> Optional[Tuple[int, ...]]:
     """
-    Highest-numbered comparison based on digits found in the tag.
+    Convert tag to a numeric tuple for comparison.
     Examples:
       v1.30.5 -> (1, 30, 5)
       2.9.3   -> (2, 9, 3)
@@ -157,7 +170,6 @@ def build_keep_latest_set(images: List[str]) -> set[str]:
     for _base, refs in grouped.items():
         best: Optional[ImageRef] = None
         best_vk: Optional[Tuple[int, ...]] = None
-
         for r in refs:
             vk = version_key(r.tag or "")
             if vk is None:
@@ -249,7 +261,7 @@ def print_results(stats: Stats, backup: Path, updated: Path) -> None:
 
 
 # ----------------------------
-# CLI command
+# Subcommand: butcher
 # ----------------------------
 
 @app.command("butcher")
@@ -268,26 +280,14 @@ def butcher(
         "--keep-latest-only",
         help="For each image repo, keep only the highest numbered tag (drops other versions).",
     ),
-    drop_k3s: bool = typer.Option(
-        False,
-        "--drop-k3s",
-        help="Drop all images that contain 'k3s' in the image reference.",
-    ),
-    drop_rke2: bool = typer.Option(
-        False,
-        "--drop-rke2",
-        help="Drop all images that contain 'rke2' in the image reference.",
-    ),
+    drop_k3s: bool = typer.Option(False, "--drop-k3s", help="Drop all images containing 'k3s'."),
+    drop_rke2: bool = typer.Option(False, "--drop-rke2", help="Drop all images containing 'rke2'."),
     drop_cloud_providers: bool = typer.Option(
         False,
         "--drop-cloud-providers",
-        help="Drop all images containing aks/eks/gke/vsphere in the image reference.",
+        help="Drop all images containing aks/eks/gke/vsphere (not azure).",
     ),
-    yes: bool = typer.Option(
-        False,
-        "--yes",
-        help="Skip the destructive confirmation prompt and write changes immediately.",
-    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the destructive confirmation prompt."),
 ) -> None:
     raw = filename.read_text(encoding="utf-8")
     data = yaml.safe_load(raw)
@@ -305,13 +305,9 @@ def butcher(
 
     if not yes:
         console.print()
-        console.print("[bold yellow]About to butcher this manifest in-place.[/bold yellow]")
+        console.print("[bold yellow]⚠️  About to butcher this manifest in-place.[/bold yellow]")
         console.print(f"[bold]File:[/bold] {filename}")
         console.print(f"[bold]Backup:[/bold] {backup}")
-        console.print(
-            f"[bold]Plan:[/bold] drop_k3s={drop_k3s}, drop_rke2={drop_rke2}, "
-            f"drop_cloud_providers={drop_cloud_providers}, keep_latest_only={keep_latest_only}"
-        )
         console.print(
             f"[bold]Impact:[/bold] images_seen={stats.total_images_seen}, "
             f"dropped_by_flags={stats.dropped_by_flag}, "
@@ -323,29 +319,14 @@ def butcher(
             raise typer.Exit(code=1)
 
     shutil.copy2(filename, backup)
-
-    dumped = yaml.safe_dump(
-        new_data,
-        sort_keys=False,
-        default_flow_style=False,
-        width=120,
-    )
+    dumped = yaml.safe_dump(new_data, sort_keys=False, default_flow_style=False, width=120)
     filename.write_text(dumped, encoding="utf-8")
 
     print_results(stats, backup, filename)
 
 
-# ----------------------------
-# Console entrypoint
-# ----------------------------
-
 def entrypoint() -> None:
-    """
-    Hard-force group behavior by building the Click command explicitly.
-    This avoids any Typer inference/caching that can produce "unexpected extra argument".
-    """
-    cmd = get_command(app)  # builds the Click Group from registered Typer commands
-    cmd(prog_name="leanhaul")
+    app()
 
 
 if __name__ == "__main__":
