@@ -9,4 +9,4 @@ dependencies = [
 ]
 
 [project.scripts]
-leanhaul = "leanhaul.cli:app"
+leanhaul = "leanhaul.cli:entrypoint"

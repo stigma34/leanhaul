@@ -368,10 +368,20 @@ def butcher(
     print_results(stats, backup, filename)
 
 
-def main() -> None:
-    # IMPORTANT: this is what makes it a multi-command app
+def entrypoint() -> None:
+    """
+    Console-script entrypoint.
+
+    Forces Typer to rebuild the underlying Click command each run so we never end up
+    with a cached single-command CLI (which causes 'unexpected extra argument').
+    """
+    # Typer caches the generated Click command on the Typer instance.
+    # If it was generated before commands were registered, you get a non-group CLI.
+    if hasattr(app, "_command"):
+        app._command = None  # type: ignore[attr-defined]
     app()
 
 
 if __name__ == "__main__":
-    main()
+    entrypoint()
+
