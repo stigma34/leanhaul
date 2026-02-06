@@ -10,6 +10,7 @@ import typer
 import yaml
 from rich.console import Console
 from rich.table import Table
+from typer.main import get_command
 
 # ----------------------------
 # App setup (MULTI-COMMAND)
@@ -33,13 +34,13 @@ IMAGE_KEY_CANDIDATES = {"image", "images"}
 @dataclass(frozen=True)
 class ImageRef:
     original: str
-    base: str         # repo path without tag/digest, e.g. ghcr.io/org/img
+    base: str
     tag: Optional[str]
     digest: Optional[str]
 
 
 _IMAGE_WITH_DIGEST = re.compile(r"^(?P<base>.+?)@(?P<digest>sha256:[0-9a-fA-F]{64})$")
-_IMAGE_WITH_TAG = re.compile(r"^(?P<base>.+?):(?P<tag>[^/]+)$")  # tag can't contain '/'
+_IMAGE_WITH_TAG = re.compile(r"^(?P<base>.+?):(?P<tag>[^/]+)$")  # tag cannot contain '/'
 
 
 def parse_image_ref(s: str) -> Optional[ImageRef]:
@@ -49,24 +50,12 @@ def parse_image_ref(s: str) -> Optional[ImageRef]:
 
     m = _IMAGE_WITH_DIGEST.match(s)
     if m:
-        return ImageRef(
-            original=s,
-            base=m.group("base"),
-            tag=None,
-            digest=m.group("digest"),
-        )
+        return ImageRef(original=s, base=m.group("base"), tag=None, digest=m.group("digest"))
 
-    # Tag heuristic (works for common image refs; avoids confusing host:port by restricting tag)
     m = _IMAGE_WITH_TAG.match(s)
     if m:
-        return ImageRef(
-            original=s,
-            base=m.group("base"),
-            tag=m.group("tag"),
-            digest=None,
-        )
+        return ImageRef(original=s, base=m.group("base"), tag=m.group("tag"), digest=None)
 
-    # No tag/digest => treat whole thing as base if it looks like an image-ish string
     if "/" in s or "." in s:
         return ImageRef(original=s, base=s, tag=None, digest=None)
 
@@ -84,12 +73,11 @@ def normalize_tag(tag: str) -> str:
 
 def version_key(tag: str) -> Optional[Tuple[int, ...]]:
     """
-    Extract a numeric tuple for comparing "highest numbered version".
+    Highest-numbered comparison based on digits found in the tag.
     Examples:
       v1.30.5 -> (1, 30, 5)
       2.9.3   -> (2, 9, 3)
       1.2.3-rke2r1 -> (1, 2, 3, 1)
-    If no digits exist, return None.
     """
     t = normalize_tag(tag)
     nums = re.findall(r"\d+", t)
@@ -113,7 +101,7 @@ def make_drop_predicate(
     if drop_rke2:
         needles.append("rke2")
     if drop_cloud_providers:
-        # NOTE: this intentionally does NOT include "azure" (your registry might include it)
+        # Intentionally excludes "azure" per your note
         needles.extend(["aks", "eks", "gke", "vsphere"])
 
     needles_lower = [n.lower() for n in needles]
@@ -137,12 +125,6 @@ class Stats:
 
 
 def collect_images(node: Any, images: List[str]) -> None:
-    """
-    Collect image strings from:
-      - any list item that looks like an image ref
-      - dict keys named image/images (string or list of strings)
-    Recurses through the whole structure.
-    """
     if isinstance(node, dict):
         for k, v in node.items():
             if isinstance(k, str) and k.lower() in IMAGE_KEY_CANDIDATES:
@@ -161,11 +143,6 @@ def collect_images(node: Any, images: List[str]) -> None:
 
 
 def build_keep_latest_set(images: List[str]) -> set[str]:
-    """
-    For each image base (repo), keep only the highest numeric tag.
-    - Digest refs and untagged refs are not compared.
-    - Tags with no digits are ignored (left untouched).
-    """
     grouped: Dict[str, List[ImageRef]] = {}
     for s in images:
         ref = parse_image_ref(s)
@@ -177,7 +154,7 @@ def build_keep_latest_set(images: List[str]) -> set[str]:
         grouped.setdefault(ref.base, []).append(ref)
 
     keep: set[str] = set(images)
-    for base, refs in grouped.items():
+    for _base, refs in grouped.items():
         best: Optional[ImageRef] = None
         best_vk: Optional[Tuple[int, ...]] = None
 
@@ -185,7 +162,7 @@ def build_keep_latest_set(images: List[str]) -> set[str]:
             vk = version_key(r.tag or "")
             if vk is None:
                 continue
-            if best is None or (best_vk is not None and vk > best_vk) or best_vk is None:
+            if best is None or best_vk is None or vk > best_vk:
                 best = r
                 best_vk = vk
 
@@ -205,13 +182,9 @@ def filter_manifest(
     keep_set: Optional[set[str]],
     stats: Stats,
 ) -> Any:
-    """
-    Returns a filtered copy of the manifest node, removing image entries where applicable.
-    """
     if isinstance(node, dict):
         new: Dict[Any, Any] = {}
         for k, v in node.items():
-            # Special-case image/images keys for nice list filtering
             if isinstance(k, str) and k.lower() in IMAGE_KEY_CANDIDATES:
                 if isinstance(v, str) and is_probable_image_string(v):
                     stats.total_images_seen += 1
@@ -316,10 +289,6 @@ def butcher(
         help="Skip the destructive confirmation prompt and write changes immediately.",
     ),
 ) -> None:
-    """
-    Scrape a YAML manifest and remove images based on flags, optionally keeping only latest versions.
-    Writes the result back to the same file and creates <file>.bak.
-    """
     raw = filename.read_text(encoding="utf-8")
     data = yaml.safe_load(raw)
 
@@ -334,10 +303,9 @@ def butcher(
 
     backup = filename.with_suffix(filename.suffix + ".bak")
 
-    # "Second confirmation" — do this RIGHT before the destructive action.
     if not yes:
         console.print()
-        console.print("[bold yellow]⚠️  About to butcher this manifest in-place.[/bold yellow]")
+        console.print("[bold yellow]About to butcher this manifest in-place.[/bold yellow]")
         console.print(f"[bold]File:[/bold] {filename}")
         console.print(f"[bold]Backup:[/bold] {backup}")
         console.print(
@@ -350,13 +318,12 @@ def butcher(
             f"dropped_by_keep_latest={stats.dropped_by_keep_latest}"
         )
         console.print()
-
         if not typer.confirm("Proceed and overwrite the file?"):
             console.print("[bold]Aborted.[/bold] No changes were written.")
             raise typer.Exit(code=1)
 
-    # Backup then write
     shutil.copy2(filename, backup)
+
     dumped = yaml.safe_dump(
         new_data,
         sort_keys=False,
@@ -368,20 +335,18 @@ def butcher(
     print_results(stats, backup, filename)
 
 
+# ----------------------------
+# Console entrypoint
+# ----------------------------
+
 def entrypoint() -> None:
     """
-    Console-script entrypoint.
-
-    Forces Typer to rebuild the underlying Click command each run so we never end up
-    with a cached single-command CLI (which causes 'unexpected extra argument').
+    Hard-force group behavior by building the Click command explicitly.
+    This avoids any Typer inference/caching that can produce "unexpected extra argument".
     """
-    # Typer caches the generated Click command on the Typer instance.
-    # If it was generated before commands were registered, you get a non-group CLI.
-    if hasattr(app, "_command"):
-        app._command = None  # type: ignore[attr-defined]
-    app()
+    cmd = get_command(app)  # builds the Click Group from registered Typer commands
+    cmd(prog_name="leanhaul")
 
 
 if __name__ == "__main__":
     entrypoint()
-

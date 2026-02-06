@@ -10,3 +10,4 @@ dependencies = [
 
 [project.scripts]
 leanhaul = "leanhaul.cli:entrypoint"
+
