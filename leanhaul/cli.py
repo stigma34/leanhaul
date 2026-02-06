@@ -11,10 +11,15 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
+# ----------------------------
+# App setup (MULTI-COMMAND)
+# ----------------------------
+
 app = typer.Typer(
     name="leanhaul",
-    help="Leanhaul: manifest butchering utilities (typer + rich).",
+    help="Leanhaul: manifest butchering utilities.",
     add_completion=False,
+    no_args_is_help=True,
 )
 console = Console()
 
@@ -36,6 +41,7 @@ class ImageRef:
 _IMAGE_WITH_DIGEST = re.compile(r"^(?P<base>.+?)@(?P<digest>sha256:[0-9a-fA-F]{64})$")
 _IMAGE_WITH_TAG = re.compile(r"^(?P<base>.+?):(?P<tag>[^/]+)$")  # tag can't contain '/'
 
+
 def parse_image_ref(s: str) -> Optional[ImageRef]:
     s = s.strip()
     if not s or " " in s:
@@ -43,19 +49,24 @@ def parse_image_ref(s: str) -> Optional[ImageRef]:
 
     m = _IMAGE_WITH_DIGEST.match(s)
     if m:
-        base = m.group("base")
-        digest = m.group("digest")
-        return ImageRef(original=s, base=base, tag=None, digest=digest)
+        return ImageRef(
+            original=s,
+            base=m.group("base"),
+            tag=None,
+            digest=m.group("digest"),
+        )
 
-    # Heuristic: tag is after last ":" but only if it isn't part of a host:port.
-    # We rely on regex above: tag cannot contain "/"
+    # Tag heuristic (works for common image refs; avoids confusing host:port by restricting tag)
     m = _IMAGE_WITH_TAG.match(s)
     if m:
-        base = m.group("base")
-        tag = m.group("tag")
-        return ImageRef(original=s, base=base, tag=tag, digest=None)
+        return ImageRef(
+            original=s,
+            base=m.group("base"),
+            tag=m.group("tag"),
+            digest=None,
+        )
 
-    # No tag/digest => treat whole thing as base
+    # No tag/digest => treat whole thing as base if it looks like an image-ish string
     if "/" in s or "." in s:
         return ImageRef(original=s, base=s, tag=None, digest=None)
 
@@ -63,12 +74,10 @@ def parse_image_ref(s: str) -> Optional[ImageRef]:
 
 
 def is_probable_image_string(s: str) -> bool:
-    # conservative: only consider strings that look like image refs
     return parse_image_ref(s) is not None
 
 
 def normalize_tag(tag: str) -> str:
-    # Strip common "v" prefix, keep original around for output filtering.
     tag = tag.strip()
     return tag[1:] if tag.lower().startswith("v") else tag
 
@@ -77,9 +86,9 @@ def version_key(tag: str) -> Optional[Tuple[int, ...]]:
     """
     Extract a numeric tuple for comparing "highest numbered version".
     Examples:
-      v1.30.5 -> (1,30,5)
-      2.9.3   -> (2,9,3)
-      1.2.3-rke2r1 -> (1,2,3,1)
+      v1.30.5 -> (1, 30, 5)
+      2.9.3   -> (2, 9, 3)
+      1.2.3-rke2r1 -> (1, 2, 3, 1)
     If no digits exist, return None.
     """
     t = normalize_tag(tag)
@@ -98,13 +107,13 @@ def make_drop_predicate(
     drop_rke2: bool,
     drop_cloud_providers: bool,
 ) -> Callable[[str], bool]:
-    # Returns True if an image string should be DROPPED.
     needles: List[str] = []
     if drop_k3s:
         needles.append("k3s")
     if drop_rke2:
         needles.append("rke2")
     if drop_cloud_providers:
+        # NOTE: this intentionally does NOT include "azure" (your registry might include it)
         needles.extend(["aks", "eks", "gke", "vsphere"])
 
     needles_lower = [n.lower() for n in needles]
@@ -128,6 +137,12 @@ class Stats:
 
 
 def collect_images(node: Any, images: List[str]) -> None:
+    """
+    Collect image strings from:
+      - any list item that looks like an image ref
+      - dict keys named image/images (string or list of strings)
+    Recurses through the whole structure.
+    """
     if isinstance(node, dict):
         for k, v in node.items():
             if isinstance(k, str) and k.lower() in IMAGE_KEY_CANDIDATES:
@@ -148,8 +163,8 @@ def collect_images(node: Any, images: List[str]) -> None:
 def build_keep_latest_set(images: List[str]) -> set[str]:
     """
     For each image base (repo), keep only the highest numeric tag.
-    - If an image has no tag (or only digest), we do not try to compare it.
-    - If tags for a base have no numeric content, we leave them untouched.
+    - Digest refs and untagged refs are not compared.
+    - Tags with no digits are ignored (left untouched).
     """
     grouped: Dict[str, List[ImageRef]] = {}
     for s in images:
@@ -161,23 +176,22 @@ def build_keep_latest_set(images: List[str]) -> set[str]:
             continue
         grouped.setdefault(ref.base, []).append(ref)
 
-    keep: set[str] = set(images)  # start by keeping everything; we’ll remove losers
+    keep: set[str] = set(images)
     for base, refs in grouped.items():
-        # find max version tuple among refs
-        best = None
-        best_vk = None
+        best: Optional[ImageRef] = None
+        best_vk: Optional[Tuple[int, ...]] = None
+
         for r in refs:
             vk = version_key(r.tag or "")
             if vk is None:
                 continue
-            if best is None or vk > best_vk:  # type: ignore[operator]
+            if best is None or (best_vk is not None and vk > best_vk) or best_vk is None:
                 best = r
                 best_vk = vk
 
         if best is None:
             continue
 
-        # drop other versioned refs for this base
         for r in refs:
             if r.original != best.original:
                 keep.discard(r.original)
@@ -249,8 +263,20 @@ def filter_manifest(
     return node
 
 
+def print_results(stats: Stats, backup: Path, updated: Path) -> None:
+    table = Table(title="leanhaul butcher results", show_lines=False)
+    table.add_column("Metric")
+    table.add_column("Count", justify="right")
+    table.add_row("Images seen", str(stats.total_images_seen))
+    table.add_row("Dropped by flags", str(stats.dropped_by_flag))
+    table.add_row("Dropped by keep-latest-only", str(stats.dropped_by_keep_latest))
+    table.add_row("Backup written", str(backup))
+    table.add_row("Updated manifest", str(updated))
+    console.print(table)
+
+
 # ----------------------------
-# CLI
+# CLI command
 # ----------------------------
 
 @app.command("butcher")
@@ -284,6 +310,11 @@ def butcher(
         "--drop-cloud-providers",
         help="Drop all images containing aks/eks/gke/vsphere in the image reference.",
     ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Skip the destructive confirmation prompt and write changes immediately.",
+    ),
 ) -> None:
     """
     Scrape a YAML manifest and remove images based on flags, optionally keeping only latest versions.
@@ -292,7 +323,6 @@ def butcher(
     raw = filename.read_text(encoding="utf-8")
     data = yaml.safe_load(raw)
 
-    # Collect all images first (for keep-latest grouping)
     images: List[str] = []
     collect_images(data, images)
 
@@ -302,10 +332,31 @@ def butcher(
     stats = Stats()
     new_data = filter_manifest(data, should_drop, keep_set, stats)
 
-    # Backup then write
     backup = filename.with_suffix(filename.suffix + ".bak")
-    shutil.copy2(filename, backup)
 
+    # "Second confirmation" — do this RIGHT before the destructive action.
+    if not yes:
+        console.print()
+        console.print("[bold yellow]⚠️  About to butcher this manifest in-place.[/bold yellow]")
+        console.print(f"[bold]File:[/bold] {filename}")
+        console.print(f"[bold]Backup:[/bold] {backup}")
+        console.print(
+            f"[bold]Plan:[/bold] drop_k3s={drop_k3s}, drop_rke2={drop_rke2}, "
+            f"drop_cloud_providers={drop_cloud_providers}, keep_latest_only={keep_latest_only}"
+        )
+        console.print(
+            f"[bold]Impact:[/bold] images_seen={stats.total_images_seen}, "
+            f"dropped_by_flags={stats.dropped_by_flag}, "
+            f"dropped_by_keep_latest={stats.dropped_by_keep_latest}"
+        )
+        console.print()
+
+        if not typer.confirm("Proceed and overwrite the file?"):
+            console.print("[bold]Aborted.[/bold] No changes were written.")
+            raise typer.Exit(code=1)
+
+    # Backup then write
+    shutil.copy2(filename, backup)
     dumped = yaml.safe_dump(
         new_data,
         sort_keys=False,
@@ -314,18 +365,11 @@ def butcher(
     )
     filename.write_text(dumped, encoding="utf-8")
 
-    table = Table(title="leanhaul butcher results", show_lines=False)
-    table.add_column("Metric")
-    table.add_column("Count", justify="right")
-    table.add_row("Images seen", str(stats.total_images_seen))
-    table.add_row("Dropped by flags", str(stats.dropped_by_flag))
-    table.add_row("Dropped by keep-latest-only", str(stats.dropped_by_keep_latest))
-    table.add_row("Backup written", str(backup))
-    table.add_row("Updated manifest", str(filename))
-    console.print(table)
+    print_results(stats, backup, filename)
 
 
 def main() -> None:
+    # IMPORTANT: this is what makes it a multi-command app
     app()
 
 
